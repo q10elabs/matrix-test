@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Synchronize Matrix events, accept pending invites, and send messages.
+Synchronize Matrix events, accept pending invites, and send messages with E2E encryption.
 
 This program logs in a user, processes incoming events from the Matrix sync protocol,
 automatically accepts pending invites, and optionally sends a message to a specified room.
+Supports end-to-end encryption via Olm and Megolm with SSSS key storage.
 
 The sync cursor is persisted server-side using the Matrix account data API, allowing
 the client to resume from where it left off on subsequent runs without reprocessing events.
+
+Encryption state is stored via SSSS (Secrets Storage Service) in account data, with the
+encryption key derived from the user's login password.
 
 Examples:
   python sync_and_invite.py alice '#myroom:localhost'
@@ -22,6 +26,7 @@ import argparse
 from urllib.parse import urljoin
 from matrix_client.client import MatrixClient
 from matrix_client.errors import MatrixRequestError
+from encryption import E2EEncryption
 
 
 def get_server_url():
@@ -46,7 +51,7 @@ def login_user(username):
         username: The username (e.g., alice) or full user ID format (@alice:localhost)
 
     Returns:
-        Tuple of (success: bool, (client: MatrixClient, user_id: str) or message: str)
+        Tuple of (success: bool, (client: MatrixClient, user_id: str, password: str) or message: str)
     """
     server_url = get_server_url()
 
@@ -73,7 +78,7 @@ def login_user(username):
         access_token = client.login(user_id_to_try, password)
         # User ID is stored in the client after login
         user_id = client.user_id
-        return True, (client, user_id)
+        return True, (client, user_id, password)
     except MatrixRequestError as e:
         return False, f"Login failed: {str(e)}"
     except Exception as e:
@@ -160,12 +165,15 @@ def accept_pending_invites(client, invited_rooms):
     return joined
 
 
-def process_events(sync_data):
+def process_events(sync_data, e2e=None):
     """
     Extract and format events from sync response.
 
+    Decrypts encrypted messages if E2E encryption is enabled.
+
     Args:
         sync_data: The sync response data
+        e2e: Optional E2EEncryption instance for decryption
 
     Returns:
         Dict with event summaries
@@ -182,6 +190,18 @@ def process_events(sync_data):
     for room_id, room_data in rooms.get("join", {}).items():
         events = room_data.get("timeline", {}).get("events", [])
         if events:
+            # Decrypt encrypted messages if E2E is available
+            if e2e:
+                decrypted_events = []
+                for event in events:
+                    if event.get("type") == "m.room.encrypted":
+                        plaintext = e2e.decrypt_message(room_id, event)
+                        if plaintext:
+                            event["_decrypted_body"] = plaintext
+                            event["_was_encrypted"] = True
+                    decrypted_events.append(event)
+                events = decrypted_events
+
             events_summary["join"][room_id] = {
                 "count": len(events),
                 "events": events
@@ -223,14 +243,17 @@ def display_events(events_summary):
     print(json.dumps(events_summary, indent=2, default=str))
 
 
-def send_message_to_room(client, room_identifier, message):
+def send_message_to_room(client, room_identifier, message, e2e=None):
     """
     Send a message to a room identified by ID or alias.
+
+    Encrypts the message if the room has encryption enabled and E2E is available.
 
     Args:
         client: The MatrixClient instance
         room_identifier: Room ID (!xyz:host) or alias (#alias:host)
         message: The message text to send
+        e2e: Optional E2EEncryption instance for encryption
 
     Returns:
         Tuple of (success: bool, message: str)
@@ -238,8 +261,30 @@ def send_message_to_room(client, room_identifier, message):
     try:
         # join_room handles both room IDs and aliases
         room = client.join_room(room_identifier)
+        room_id = room.room_id
 
-        # Send the message
+        # Check if room encryption is enabled and encrypt if available
+        if e2e:
+            encrypted_content = e2e.encrypt_message(room_id, message)
+            if encrypted_content:
+                # Send encrypted message
+                try:
+                    content = {
+                        "msgtype": "m.text",
+                        "body": message,  # Fallback for non-E2E clients
+                        "m.relates_to": {
+                            "m.in_reply_to": {
+                                "event_id": "$encrypted"
+                            }
+                        }
+                    }
+                    content.update(encrypted_content)
+                    room.client.api.send_message_event(room_id, "m.room.encrypted", content)
+                    return True, f"Encrypted message sent to {room_identifier}"
+                except Exception as e:
+                    print(f"Failed to send encrypted message: {e}, falling back to plaintext")
+
+        # Send unencrypted message (fallback or if E2E not available)
         room.send_text(message)
 
         return True, f"Message sent to {room_identifier}"
@@ -305,11 +350,20 @@ Examples:
         print(result)
         sys.exit(1)
 
-    client, user_id = result
+    client, user_id, password = result
     server_url = get_server_url()
 
     print(f"Logged in as: {user_id}")
     print(f"Device ID: {client.device_id}\n")
+
+    # Initialize E2E encryption
+    print("Initializing E2E encryption...")
+    e2e = E2EEncryption(client, user_id, password)
+    if e2e.initialize():
+        print("E2E encryption initialized\n")
+    else:
+        print("Warning: E2E encryption initialization failed\n")
+        e2e = None
 
     # Retrieve stored sync token
     print("Retrieving sync state...")
@@ -327,15 +381,18 @@ Examples:
         print(f"Sync failed: {str(e)}")
         sys.exit(1)
 
-    # Update sync token and store it
+    # Update sync token and store it (unless --no-save-token flag is set)
     new_sync_token = sync_data.get("next_batch")
     if new_sync_token:
-        print(f"Updating sync token...")
-        store_sync_token(client, user_id, new_sync_token)
-        client.sync_token = new_sync_token
+        if no_save_token:
+            print(f"Skipping sync token update (--no-save-token flag set)")
+        else:
+            print(f"Updating sync token...")
+            store_sync_token(client, user_id, new_sync_token)
+            client.sync_token = new_sync_token
 
-    # Process and display events
-    events_summary = process_events(sync_data)
+    # Process and display events (with E2E decryption)
+    events_summary = process_events(sync_data, e2e)
     display_events(events_summary)
 
     # Accept pending invites
@@ -344,10 +401,10 @@ Examples:
         print("\nAccepting pending invites...")
         accept_pending_invites(client, invited_rooms)
 
-    # Send message if specified
+    # Send message if specified (with E2E encryption)
     if message:
         print(f"\nSending message to {room_identifier}...")
-        success, msg = send_message_to_room(client, room_identifier, message)
+        success, msg = send_message_to_room(client, room_identifier, message, e2e)
         print(msg)
         if not success:
             sys.exit(1)
