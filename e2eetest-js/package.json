@@ -1,0 +1,28 @@
+{
+  "name": "e2eetest-js",
+  "version": "1.0.0",
+  "description": "Matrix E2EE encryption test suite using matrix-js-sdk",
+  "scripts": {
+    "init": "tsx src/init.ts",
+    "setup": "tsx src/setup.ts",
+    "send": "tsx src/send.ts",
+    "recv": "tsx src/recv.ts"
+  },
+  "keywords": [
+    "matrix",
+    "e2ee",
+    "encryption",
+    "test"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@matrix-org/olm": "^3.2.0",
+    "matrix-js-sdk": "33.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.15.0",
+    "typescript": "^5.6.0"
+  }
+}

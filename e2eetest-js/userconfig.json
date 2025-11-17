@@ -1,0 +1,18 @@
+{
+  "users": [
+    {
+      "username": "user_5d7d8",
+      "password": "user_5d7d8",
+      "user_id": "@user_5d7d8:localhost",
+      "device_id": "KUFAKNHXST",
+      "registered_at": "2025-11-17T14:38:31.254Z"
+    },
+    {
+      "username": "user_4aa56",
+      "password": "user_4aa56",
+      "user_id": "@user_4aa56:localhost",
+      "device_id": "AWCIKICYAY",
+      "registered_at": "2025-11-17T14:38:31.502Z"
+    }
+  ]
+}
