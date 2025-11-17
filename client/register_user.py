@@ -40,7 +40,7 @@ async def register_user(username, display_name=None):
 
     try:
         # Register user
-        resp = await client.register(password, username, device_name="Test Device")
+        resp = await client.register(username, password, device_name="Test Device")
 
         if isinstance(resp, RegisterResponse):
             user_id = resp.user_id
