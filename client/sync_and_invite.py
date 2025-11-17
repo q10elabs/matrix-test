@@ -18,6 +18,7 @@ import sys
 import hashlib
 import requests
 import json
+import argparse
 from urllib.parse import urljoin
 from matrix_client.client import MatrixClient
 from matrix_client.errors import MatrixRequestError
@@ -250,23 +251,48 @@ def send_message_to_room(client, room_identifier, message):
 
 def main():
     """Main entry point."""
-    # Parse arguments
-    if len(sys.argv) < 1:
-        print("Usage: python sync_and_invite.py <username> [<room_identifier> <message>]")
-        print("")
-        print("Where:")
-        print("  <username>: Username as provided during registration (e.g., alice or @alice:localhost)")
-        print("  <room_identifier>: Optional room to send message to (e.g., #myroom:localhost or !xyz:localhost)")
-        print("  <message>: Optional message text to send (if omitted, only processes events)")
-        print("")
-        print("Examples:")
-        print("  python sync_and_invite.py alice")
-        print("  python sync_and_invite.py alice '#myroom:localhost' 'Hello world!'")
-        sys.exit(1)
+    # Parse command line arguments using argparse
+    parser = argparse.ArgumentParser(
+        description="Synchronize Matrix events, accept invites, and send messages with E2E encryption.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python sync_and_invite.py alice
+  python sync_and_invite.py alice '#myroom:localhost' 'Hello world!'
+  python sync_and_invite.py alice '#myroom:localhost' 'Hello' --no-save-token
+  python sync_and_invite.py --no-save-token alice  # flag can be anywhere
+        """
+    )
 
-    username = sys.argv[1]
-    room_identifier = sys.argv[2] if len(sys.argv) > 2 else None
-    message = sys.argv[3] if len(sys.argv) > 2 else None
+    parser.add_argument(
+        "username",
+        help="Username as provided during registration (e.g., alice or @alice:localhost)"
+    )
+    parser.add_argument(
+        "room_identifier",
+        nargs="?",
+        default=None,
+        help="Optional room to send message to (e.g., #myroom:localhost or !xyz:localhost)"
+    )
+    parser.add_argument(
+        "message",
+        nargs="?",
+        default=None,
+        help="Optional message text to send (if omitted, only processes events)"
+    )
+    parser.add_argument(
+        "--no-save-token",
+        action="store_true",
+        help="Prevent saving the sync token to account data (useful for testing)"
+    )
+
+    args = parser.parse_args()
+
+    # Extract parsed arguments
+    username = args.username
+    room_identifier = args.room_identifier
+    message = args.message
+    no_save_token = args.no_save_token
 
     # Validate input
     if not username or len(username) == 0:
