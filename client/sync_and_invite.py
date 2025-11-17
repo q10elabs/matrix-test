@@ -17,6 +17,7 @@ Examples:
   python sync_and_invite.py alice '#myroom:localhost'
   python sync_and_invite.py alice '#myroom:localhost' 'Hello from sync_and_invite!'
   python sync_and_invite.py alice '#myroom:localhost' 'Hello' --no-save-token
+  python sync_and_invite.py alice --no-load-token
 """
 
 import sys
@@ -324,6 +325,7 @@ Examples:
   python sync_and_invite.py alice
   python sync_and_invite.py alice '#myroom:localhost' 'Hello world!'
   python sync_and_invite.py alice '#myroom:localhost' 'Hello' --no-save-token
+  python sync_and_invite.py alice --no-load-token  # sync from the beginning
   python sync_and_invite.py --no-save-token alice  # flag can be anywhere
         """
     )
@@ -349,6 +351,11 @@ Examples:
         action="store_true",
         help="Prevent saving the sync token to account data (useful for testing)"
     )
+    parser.add_argument(
+        "--no-load-token",
+        action="store_true",
+        help="Skip loading the sync token, forcing a fresh sync from the beginning"
+    )
 
     args = parser.parse_args()
 
@@ -357,6 +364,7 @@ Examples:
     room_identifier = args.room_identifier
     message = args.message
     no_save_token = args.no_save_token
+    no_load_token = args.no_load_token
 
     # Validate input
     if not username or len(username) == 0:
@@ -377,11 +385,15 @@ Examples:
 
     # Retrieve stored sync token from server account data
     print("Retrieving sync state...")
-    sync_token = await get_sync_token_from_server(client, user_id)
-    if sync_token:
-        print(f"Resuming from sync token: {sync_token[:20]}...")
+    if no_load_token:
+        sync_token = None
+        print("Skipping sync token load (--no-load-token flag set)")
     else:
-        print("Starting fresh sync (no previous state)")
+        sync_token = await get_sync_token_from_server(client, user_id)
+        if sync_token:
+            print(f"Resuming from sync token: {sync_token[:20]}...")
+        else:
+            print("Starting fresh sync (no previous state)")
 
     # Perform sync
     print("Syncing events...")
