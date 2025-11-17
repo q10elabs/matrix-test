@@ -1,0 +1,101 @@
+# Synapse Homeserver Configuration
+# For local testing with localhost domain
+
+## Server basics
+server_name: "localhost"
+pid_file: /tmp/synapse.pid
+web_client_location: null
+soft_file_limit: 0
+
+## Listeners
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: false
+    bind_addresses: ['127.0.0.1', '::1', '192.168.2.20']
+    resources:
+      - names: [client, federation]
+        compress: false
+
+## Database configuration (SQLite)
+database:
+  name: sqlite3
+  args:
+    database: server/homeserver.db
+
+## Logging
+log_config: "server/log.yaml"
+
+## TLS certificates (disabled for local testing)
+tls_certificate_path: null
+tls_private_key_path: null
+tls_dh_params_path: null
+
+## Federation settings (disabled for local only testing)
+federation_domain_whitelist:
+  - "localhost"
+
+# Prevent the server from trying to contact other homeservers
+allow_federation: false
+
+## Registration
+enable_registration: true
+registration_requires_token: false
+
+## Rate limiting (disabled for testing)
+rc_message:
+  per_second: 10000
+  burst_count: 10000
+
+rc_registration:
+  per_second: 10000
+  burst_count: 10000
+
+rc_login:
+  address:
+    per_second: 10000
+    burst_count: 10000
+  account:
+    per_second: 10000
+    burst_count: 10000
+
+rc_admin_redaction:
+  per_second: 10000
+  burst_count: 10000
+
+rc_joins:
+  local:
+    per_second: 10000
+    burst_count: 10000
+  remote:
+    per_second: 10000
+    burst_count: 10000
+
+## Other settings
+allow_guest_access: true
+trusted_third_party_id_servers:
+  - matrix.org
+  - vector.im
+
+signing_key_path: "server/localhost.signing.key"
+
+# Media store path
+media_store_path: "server/media_store"
+
+## Exclude private IPs from being counted as mitigated for IP address blocking
+ip_range_blacklist:
+  - "127.0.0.0/8"
+  - "::1/128"
+
+# Turn off verbose logging for a cleaner test environment
+log_level: "INFO"
+
+## Statistics reporting
+report_stats: false
+
+## Macaroon secret (for security tokens)
+macaroon_secret_key: "mxvV8-KdGGqQcKI8eoJmkB6VFvBYVDGG5nS5B8pQxE0"
+
+## Allow registration without verification (for testing)
+enable_registration_without_verification: true
