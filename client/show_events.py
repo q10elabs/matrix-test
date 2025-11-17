@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Show pending events for a Matrix user.
+Show pending events for a Matrix user using matrix-nio.
 
 This program takes a username (e.g., alice) or full user ID format (@alice:localhost)
 and displays pending events in formatted JSON.
 
 The password is derived as MD5(username) to match the registration process.
+
+Uses the modern matrix-nio async client library.
 
 Examples:
   python show_events.py alice
@@ -14,26 +16,13 @@ Examples:
 
 import sys
 import hashlib
-import requests
 import json
-from urllib.parse import urljoin
+import asyncio
+from nio import AsyncClient
+from nio.responses import LoginResponse, SyncResponse
 
 
-def get_server_url():
-    """Return the Matrix server URL."""
-    return "http://localhost:8008"
-
-
-def check_server_connectivity(server_url):
-    """Check if the server is reachable."""
-    try:
-        response = requests.get(f"{server_url}/_matrix/client/versions", timeout=5)
-        return response.status_code == 200
-    except (requests.ConnectionError, requests.Timeout):
-        return False
-
-
-def login_user(username):
+async def login_user(username):
     """
     Login to the Matrix homeserver.
 
@@ -41,13 +30,9 @@ def login_user(username):
         username: The username (e.g., alice) or full user ID format (@alice:localhost)
 
     Returns:
-        Tuple of (success: bool, (access_token, user_id, device_id) or message: str)
+        Tuple of (success: bool, (client: AsyncClient, user_id: str) or message: str)
     """
-    server_url = get_server_url()
-
-    # Check server connectivity
-    if not check_server_connectivity(server_url):
-        return False, f"Error: Cannot connect to Matrix server at {server_url}"
+    server_url = "http://localhost:8008"
 
     # Extract the plain username for password derivation
     if username.startswith("@") and ":" in username:
@@ -62,88 +47,63 @@ def login_user(username):
     # Derive password from the plain username as MD5 hash
     password = hashlib.md5(plain_username.encode()).hexdigest()
 
-    # Login endpoint
-    login_url = urljoin(server_url, "/_matrix/client/r0/login")
+    # Create async client
+    client = AsyncClient(server_url, user_id_to_try)
 
     try:
-        data = {
-            "type": "m.login.password",
-            "user": user_id_to_try,
-            "password": password
-        }
+        # Login
+        resp = await client.login(password)
 
-        response = requests.post(login_url, json=data, timeout=10)
-
-        if response.status_code == 200:
-            result = response.json()
-            access_token = result.get("access_token")
-            user_id = result.get("user_id")
-            device_id = result.get("device_id")
-            return True, (access_token, user_id, device_id)
-
-        elif response.status_code == 429:
-            return False, "Login failed: Rate limited by server"
+        if isinstance(resp, LoginResponse):
+            user_id = resp.user_id
+            device_id = resp.device_id
+            return True, (client, user_id, device_id)
         else:
-            return False, "Login failed: Invalid username or password"
+            # Handle error response
+            error_msg = str(resp)
+            await client.close()
+            return False, f"Login failed: {error_msg}"
 
-    except requests.RequestException as e:
+    except Exception as e:
+        await client.close()
         return False, f"Error during login: {str(e)}"
 
 
-def get_pending_events(access_token):
+async def get_pending_events(client):
     """
-    Fetch pending events from the server.
+    Fetch pending events from the server using sync.
 
     Args:
-        access_token: The user's access token
+        client: The AsyncClient instance
 
     Returns:
         Tuple of (success: bool, events: dict or message: str)
     """
-    server_url = get_server_url()
-
-    # Sync endpoint
-    sync_url = urljoin(server_url, "/_matrix/client/r0/sync")
-
     try:
-        params = {
-            "access_token": access_token,
-            "timeout": 0  # Non-blocking sync
-        }
+        # Perform sync with no timeout (non-blocking)
+        resp = await client.sync(timeout=0)
 
-        response = requests.get(sync_url, params=params, timeout=10)
-
-        if response.status_code == 200:
-            result = response.json()
-            return True, result
-
-        elif response.status_code == 401:
-            return False, "Sync failed: Unauthorized (invalid access token)"
-
-        elif response.status_code == 429:
-            return False, "Sync failed: Rate limited by server"
-
+        if isinstance(resp, SyncResponse):
+            return True, resp
         else:
-            error_data = response.json()
-            error_msg = error_data.get("error", "Unknown error")
+            # Handle error response
+            error_msg = str(resp)
             return False, f"Sync failed: {error_msg}"
 
-    except requests.RequestException as e:
+    except Exception as e:
         return False, f"Error during sync: {str(e)}"
 
 
-def format_events(sync_data):
+def format_events(sync_resp):
     """
     Extract and format events from sync response.
 
     Args:
-        sync_data: The sync response data
+        sync_resp: The SyncResponse object
 
     Returns:
         Formatted event data
     """
-    rooms = sync_data.get("rooms", {})
-
     events_data = {
         "join": {},
         "invite": {},
@@ -151,27 +111,93 @@ def format_events(sync_data):
     }
 
     # Process joined rooms
-    for room_id, room_data in rooms.get("join", {}).items():
-        events = room_data.get("timeline", {}).get("events", [])
+    for room_id, room_data in sync_resp.rooms.join.items():
+        events = room_data.timeline.events
         if events:
-            events_data["join"][room_id] = events
+            # Convert event objects to dictionaries for JSON serialization
+            event_dicts = []
+            for event in events:
+                # Build event dict from available attributes
+                event_dict = {}
+
+                # Get event type - different event classes have different attributes
+                if hasattr(event, 'type'):
+                    event_dict["type"] = event.type
+
+                # Common attributes
+                for attr in ['sender', 'event_id', 'server_timestamp']:
+                    if hasattr(event, attr):
+                        event_dict[attr] = getattr(event, attr)
+
+                # Content-based attributes
+                if hasattr(event, 'body'):
+                    event_dict["body"] = event.body
+                if hasattr(event, 'content'):
+                    event_dict["content"] = event.content
+                if hasattr(event, 'membership'):
+                    event_dict["membership"] = event.membership
+
+                # Store string representation if no attributes found
+                if not event_dict:
+                    event_dict["raw"] = str(event)
+
+                event_dicts.append(event_dict)
+
+            events_data["join"][room_id] = event_dicts
 
     # Process invited rooms
-    for room_id, room_data in rooms.get("invite", {}).items():
-        invite_state = room_data.get("invite_state", {}).get("events", [])
-        if invite_state:
-            events_data["invite"][room_id] = invite_state
+    for room_id, room_data in sync_resp.rooms.invite.items():
+        # Invited rooms have invite_state with limited events
+        if room_data.invite_state:
+            event_dicts = []
+            for event in room_data.invite_state:
+                if isinstance(event, dict):
+                    event_dicts.append(event)
+                else:
+                    # Try to extract attributes
+                    event_dict = {}
+                    for attr in ['type', 'sender', 'event_id', 'content']:
+                        if hasattr(event, attr):
+                            event_dict[attr] = getattr(event, attr)
+                    if event_dict:
+                        event_dicts.append(event_dict)
+
+            if event_dicts:
+                events_data["invite"][room_id] = event_dicts
 
     # Process left rooms
-    for room_id, room_data in rooms.get("leave", {}).items():
-        events = room_data.get("timeline", {}).get("events", [])
+    for room_id, room_data in sync_resp.rooms.leave.items():
+        events = room_data.timeline.events
         if events:
-            events_data["leave"][room_id] = events
+            event_dicts = []
+            for event in events:
+                event_dict = {}
+
+                # Get event type
+                if hasattr(event, 'type'):
+                    event_dict["type"] = event.type
+
+                # Common attributes
+                for attr in ['sender', 'event_id', 'server_timestamp']:
+                    if hasattr(event, attr):
+                        event_dict[attr] = getattr(event, attr)
+
+                # Content-based attributes
+                if hasattr(event, 'body'):
+                    event_dict["body"] = event.body
+                if hasattr(event, 'content'):
+                    event_dict["content"] = event.content
+
+                if event_dict:
+                    event_dicts.append(event_dict)
+
+            if event_dicts:
+                events_data["leave"][room_id] = event_dicts
 
     return events_data
 
 
-def main():
+async def main():
     """Main entry point."""
     if len(sys.argv) != 2:
         print("Usage: python show_events.py <username>")
@@ -192,19 +218,20 @@ def main():
         sys.exit(1)
 
     # Login
-    success, result = login_user(username)
+    success, result = await login_user(username)
     if not success:
         print(result)
         sys.exit(1)
 
-    access_token, user_id, device_id = result
+    client, user_id, device_id = result
     print(f"Logged in as: {user_id}")
     print(f"Device ID: {device_id}\n")
 
     # Get pending events
-    success, result = get_pending_events(access_token)
+    success, result = await get_pending_events(client)
     if not success:
         print(result)
+        await client.close()
         sys.exit(1)
 
     # Format and display events
@@ -212,12 +239,13 @@ def main():
 
     if any(events["join"].values()) or any(events["invite"].values()) or any(events["leave"].values()):
         print("Pending Events:")
-        print(json.dumps(events, indent=2))
+        print(json.dumps(events, indent=2, default=str))
     else:
         print("No pending events found.")
 
+    await client.close()
     sys.exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

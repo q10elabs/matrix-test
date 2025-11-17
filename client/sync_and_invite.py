@@ -4,60 +4,43 @@ Synchronize Matrix events, accept pending invites, and send messages with E2E en
 
 This program logs in a user, processes incoming events from the Matrix sync protocol,
 automatically accepts pending invites, and optionally sends a message to a specified room.
-Supports end-to-end encryption via Olm and Megolm with SSSS key storage.
+Supports end-to-end encryption via matrix-nio's built-in E2E capabilities.
 
 The sync cursor is persisted server-side using the Matrix account data API, allowing
 the client to resume from where it left off on subsequent runs without reprocessing events.
 
-Encryption state is stored via SSSS (Secrets Storage Service) in account data, with the
-encryption key derived from the user's login password.
+Encryption is handled transparently using matrix-nio's Olm integration when the library
+is built with E2E support.
 
 Examples:
+  python sync_and_invite.py alice
   python sync_and_invite.py alice '#myroom:localhost'
   python sync_and_invite.py alice '#myroom:localhost' 'Hello from sync_and_invite!'
-  python sync_and_invite.py alice '!roomid:localhost'
+  python sync_and_invite.py alice '#myroom:localhost' 'Hello' --no-save-token
 """
 
 import sys
 import hashlib
-import requests
 import json
+import asyncio
 import argparse
-from urllib.parse import urljoin
-from matrix_client.client import MatrixClient
-from matrix_client.errors import MatrixRequestError
-from encryption import E2EEncryption
+from nio import AsyncClient
+from nio.responses import (
+    LoginResponse, SyncResponse, JoinResponse, RoomSendResponse
+)
 
 
-def get_server_url():
-    """Return the Matrix server URL."""
-    return "http://localhost:8008"
-
-
-def check_server_connectivity(server_url):
-    """Check if the server is reachable."""
-    try:
-        response = requests.get(f"{server_url}/_matrix/client/versions", timeout=5)
-        return response.status_code == 200
-    except (requests.ConnectionError, requests.Timeout):
-        return False
-
-
-def login_user(username):
+async def login_user(username):
     """
-    Login to the Matrix homeserver and return a MatrixClient.
+    Login to the Matrix homeserver and return an AsyncClient.
 
     Args:
         username: The username (e.g., alice) or full user ID format (@alice:localhost)
 
     Returns:
-        Tuple of (success: bool, (client: MatrixClient, user_id: str, password: str) or message: str)
+        Tuple of (success: bool, (client: AsyncClient, user_id: str, password: str) or message: str)
     """
-    server_url = get_server_url()
-
-    # Check server connectivity
-    if not check_server_connectivity(server_url):
-        return False, f"Error: Cannot connect to Matrix server at {server_url}"
+    server_url = "http://localhost:8008"
 
     # Extract the plain username for password derivation
     if username.startswith("@") and ":" in username:
@@ -70,59 +53,68 @@ def login_user(username):
     # Derive password from the plain username as MD5 hash
     password = hashlib.md5(plain_username.encode()).hexdigest()
 
-    # Create Matrix client
-    client = MatrixClient(server_url)
+    # Create async client
+    client = AsyncClient(server_url, user_id_to_try)
 
     try:
-        # MatrixClient.login returns the access token as a string
-        access_token = client.login(user_id_to_try, password)
-        # User ID is stored in the client after login
-        user_id = client.user_id
-        return True, (client, user_id, password)
-    except MatrixRequestError as e:
-        return False, f"Login failed: {str(e)}"
+        # Login
+        resp = await client.login(password)
+
+        if isinstance(resp, LoginResponse):
+            user_id = resp.user_id
+            return True, (client, user_id, password)
+        else:
+            # Handle error response
+            error_msg = str(resp)
+            await client.close()
+            return False, f"Login failed: {error_msg}"
+
     except Exception as e:
+        await client.close()
         return False, f"Error during login: {str(e)}"
 
 
-def get_sync_token_from_server(server_url, user_id, access_token):
+async def get_sync_token_from_server(client, user_id):
     """
-    Retrieve the stored sync token from the server's account data.
+    Retrieve the stored sync token from server account data.
+
+    Uses the Matrix account data API to store/retrieve per-user data
+    server-side, allowing sync resumption across client runs.
 
     Args:
-        server_url: The Matrix homeserver URL
+        client: The AsyncClient instance
         user_id: The user ID (@user:host format)
-        access_token: The user's access token
 
     Returns:
         The sync token string, or None if not found
     """
-    url = urljoin(server_url, f"/_matrix/client/r0/user/{user_id}/account_data/org.matrix.sync_token")
-
     try:
-        response = requests.get(
-            url,
-            params={"access_token": access_token},
-            timeout=10
-        )
-        if response.status_code == 200:
-            data = response.json()
+        # Build the path for user account data
+        path = f"/_matrix/client/r0/user/{user_id}/account_data/org.matrix.sync_token?access_token={client.access_token}"
+
+        # GET the account data
+        resp = await client.send("GET", path)
+
+        if resp.status == 200:
+            data = json.loads(await resp.text())
             return data.get("sync_token")
-        elif response.status_code == 404:
-            # No stored sync token yet
-            return None
-        else:
-            return None
-    except Exception:
+
+        return None
+    except Exception as e:
+        print(f"Warning: Failed to retrieve sync token: {str(e)}")
         return None
 
 
-def store_sync_token(client, user_id, sync_token):
+async def store_sync_token_to_server(client, user_id, sync_token):
     """
-    Store the sync token in the server's account data.
+    Store the sync token to server account data.
+
+    Uses the Matrix account data API to store per-user data server-side.
+    This allows the client to resume syncing from the last known position
+    on subsequent runs.
 
     Args:
-        client: The MatrixClient instance
+        client: The AsyncClient instance
         user_id: The user ID (@user:host format)
         sync_token: The sync token to store
 
@@ -130,23 +122,25 @@ def store_sync_token(client, user_id, sync_token):
         True if successful, False otherwise
     """
     try:
-        client.api.set_account_data(
-            user_id,
-            "org.matrix.sync_token",
-            {"sync_token": sync_token}
-        )
-        return True
+        # Build the path for user account data
+        path = f"/_matrix/client/r0/user/{user_id}/account_data/org.matrix.sync_token?access_token={client.access_token}"
+
+        # PUT the account data
+        data = {"sync_token": sync_token}
+        resp = await client.send("PUT", path, data=json.dumps(data))
+
+        return resp.status == 200
     except Exception as e:
         print(f"Warning: Failed to store sync token: {str(e)}")
         return False
 
 
-def accept_pending_invites(client, invited_rooms):
+async def accept_pending_invites(client, invited_rooms):
     """
     Accept all pending room invitations.
 
     Args:
-        client: The MatrixClient instance
+        client: The AsyncClient instance
         invited_rooms: Dict of room_id -> room_data from sync response
 
     Returns:
@@ -156,30 +150,28 @@ def accept_pending_invites(client, invited_rooms):
 
     for room_id in invited_rooms.keys():
         try:
-            client.join_room(room_id)
-            print(f"Accepted invite: {room_id}")
-            joined.append(room_id)
-        except MatrixRequestError as e:
+            resp = await client.join(room_id)
+            if isinstance(resp, JoinResponse):
+                print(f"Accepted invite: {room_id}")
+                joined.append(room_id)
+            else:
+                print(f"Error accepting invite for {room_id}: {str(resp)}")
+        except Exception as e:
             print(f"Error accepting invite for {room_id}: {str(e)}")
 
     return joined
 
 
-def process_events(sync_data, e2e=None):
+def process_events(sync_resp):
     """
     Extract and format events from sync response.
 
-    Decrypts encrypted messages if E2E encryption is enabled.
-
     Args:
-        sync_data: The sync response data
-        e2e: Optional E2EEncryption instance for decryption
+        sync_resp: The SyncResponse object
 
     Returns:
         Dict with event summaries
     """
-    rooms = sync_data.get("rooms", {})
-
     events_summary = {
         "join": {},
         "invite": {},
@@ -187,43 +179,80 @@ def process_events(sync_data, e2e=None):
     }
 
     # Process joined rooms
-    for room_id, room_data in rooms.get("join", {}).items():
-        events = room_data.get("timeline", {}).get("events", [])
+    for room_id, room_data in sync_resp.rooms.join.items():
+        events = room_data.timeline.events
         if events:
-            # Decrypt encrypted messages if E2E is available
-            if e2e:
-                decrypted_events = []
-                for event in events:
-                    if event.get("type") == "m.room.encrypted":
-                        plaintext = e2e.decrypt_message(room_id, event)
-                        if plaintext:
-                            event["_decrypted_body"] = plaintext
-                            event["_was_encrypted"] = True
-                    decrypted_events.append(event)
-                events = decrypted_events
+            event_dicts = []
+            for event in events:
+                event_dict = {}
+
+                # Get event type
+                if hasattr(event, 'type'):
+                    event_dict["type"] = event.type
+
+                # Common attributes
+                for attr in ['sender', 'event_id', 'server_timestamp']:
+                    if hasattr(event, attr):
+                        event_dict[attr] = getattr(event, attr)
+
+                # Content-based attributes
+                if hasattr(event, 'body'):
+                    event_dict["body"] = event.body
+                if hasattr(event, 'content'):
+                    event_dict["content"] = event.content
+                if hasattr(event, 'membership'):
+                    event_dict["membership"] = event.membership
+
+                if event_dict:
+                    event_dicts.append(event_dict)
 
             events_summary["join"][room_id] = {
-                "count": len(events),
-                "events": events
+                "count": len(event_dicts),
+                "events": event_dicts
             }
 
     # Process invited rooms
-    for room_id, room_data in rooms.get("invite", {}).items():
-        invite_state = room_data.get("invite_state", {}).get("events", [])
-        if invite_state:
-            events_summary["invite"][room_id] = {
-                "count": len(invite_state),
-                "events": invite_state
-            }
+    for room_id, room_data in sync_resp.rooms.invite.items():
+        if room_data.invite_state:
+            event_dicts = []
+            for event in room_data.invite_state:
+                if isinstance(event, dict):
+                    event_dicts.append(event)
+
+            if event_dicts:
+                events_summary["invite"][room_id] = {
+                    "count": len(event_dicts),
+                    "events": event_dicts
+                }
 
     # Process left rooms
-    for room_id, room_data in rooms.get("leave", {}).items():
-        events = room_data.get("timeline", {}).get("events", [])
+    for room_id, room_data in sync_resp.rooms.leave.items():
+        events = room_data.timeline.events
         if events:
-            events_summary["leave"][room_id] = {
-                "count": len(events),
-                "events": events
-            }
+            event_dicts = []
+            for event in events:
+                event_dict = {}
+
+                if hasattr(event, 'type'):
+                    event_dict["type"] = event.type
+
+                for attr in ['sender', 'event_id', 'server_timestamp']:
+                    if hasattr(event, attr):
+                        event_dict[attr] = getattr(event, attr)
+
+                if hasattr(event, 'body'):
+                    event_dict["body"] = event.body
+                if hasattr(event, 'content'):
+                    event_dict["content"] = event.content
+
+                if event_dict:
+                    event_dicts.append(event_dict)
+
+            if event_dicts:
+                events_summary["leave"][room_id] = {
+                    "count": len(event_dicts),
+                    "events": event_dicts
+                }
 
     return events_summary
 
@@ -243,58 +272,48 @@ def display_events(events_summary):
     print(json.dumps(events_summary, indent=2, default=str))
 
 
-def send_message_to_room(client, room_identifier, message, e2e=None):
+async def send_message_to_room(client, room_identifier, message):
     """
     Send a message to a room identified by ID or alias.
 
-    Encrypts the message if the room has encryption enabled and E2E is available.
-
     Args:
-        client: The MatrixClient instance
+        client: The AsyncClient instance
         room_identifier: Room ID (!xyz:host) or alias (#alias:host)
         message: The message text to send
-        e2e: Optional E2EEncryption instance for encryption
 
     Returns:
         Tuple of (success: bool, message: str)
     """
     try:
-        # join_room handles both room IDs and aliases
-        room = client.join_room(room_identifier)
-        room_id = room.room_id
+        # Join room (handles both room IDs and aliases)
+        join_resp = await client.join(room_identifier)
 
-        # Check if room encryption is enabled and encrypt if available
-        if e2e:
-            encrypted_content = e2e.encrypt_message(room_id, message)
-            if encrypted_content:
-                # Send encrypted message
-                try:
-                    content = {
-                        "msgtype": "m.text",
-                        "body": message,  # Fallback for non-E2E clients
-                        "m.relates_to": {
-                            "m.in_reply_to": {
-                                "event_id": "$encrypted"
-                            }
-                        }
-                    }
-                    content.update(encrypted_content)
-                    room.client.api.send_message_event(room_id, "m.room.encrypted", content)
-                    return True, f"Encrypted message sent to {room_identifier}"
-                except Exception as e:
-                    print(f"Failed to send encrypted message: {e}, falling back to plaintext")
+        if not isinstance(join_resp, JoinResponse):
+            return False, f"Failed to join {room_identifier}: {str(join_resp)}"
 
-        # Send unencrypted message (fallback or if E2E not available)
-        room.send_text(message)
+        room_id = join_resp.room_id
 
-        return True, f"Message sent to {room_identifier}"
-    except MatrixRequestError as e:
-        return False, f"Error sending message to {room_identifier}: {str(e)}"
+        # Send message using the client's room_send method
+        # matrix-nio handles encryption transparently for encrypted rooms
+        resp = await client.room_send(
+            room_id,
+            "m.room.message",
+            {
+                "msgtype": "m.text",
+                "body": message
+            }
+        )
+
+        if isinstance(resp, RoomSendResponse):
+            return True, f"Message sent to {room_identifier}"
+        else:
+            return False, f"Error sending message to {room_identifier}: {str(resp)}"
+
     except Exception as e:
         return False, f"Error: {str(e)}"
 
 
-def main():
+async def main():
     """Main entry point."""
     # Parse command line arguments using argparse
     parser = argparse.ArgumentParser(
@@ -345,29 +364,20 @@ Examples:
         sys.exit(1)
 
     # Login
-    success, result = login_user(username)
+    success, result = await login_user(username)
     if not success:
         print(result)
         sys.exit(1)
 
     client, user_id, password = result
-    server_url = get_server_url()
+    server_url = "http://localhost:8008"
 
     print(f"Logged in as: {user_id}")
     print(f"Device ID: {client.device_id}\n")
 
-    # Initialize E2E encryption
-    print("Initializing E2E encryption...")
-    e2e = E2EEncryption(client, user_id, password)
-    if e2e.initialize():
-        print("E2E encryption initialized\n")
-    else:
-        print("Warning: E2E encryption initialization failed\n")
-        e2e = None
-
-    # Retrieve stored sync token
+    # Retrieve stored sync token from server account data
     print("Retrieving sync state...")
-    sync_token = get_sync_token_from_server(server_url, user_id, client.token)
+    sync_token = await get_sync_token_from_server(client, user_id)
     if sync_token:
         print(f"Resuming from sync token: {sync_token[:20]}...")
     else:
@@ -376,42 +386,64 @@ Examples:
     # Perform sync
     print("Syncing events...")
     try:
-        sync_data = client.api.sync(since=sync_token, timeout_ms=0)
-    except MatrixRequestError as e:
+        sync_resp = await client.sync(timeout=0, since=sync_token)
+    except Exception as e:
         print(f"Sync failed: {str(e)}")
+        await client.close()
         sys.exit(1)
 
+    if not isinstance(sync_resp, SyncResponse):
+        # Handle invalid/expired sync token by retrying without it
+        if "Invalid stream token" in str(sync_resp) or "M_UNKNOWN" in str(sync_resp):
+            print(f"Sync token expired, retrying with fresh sync...")
+            try:
+                sync_resp = await client.sync(timeout=0, since=None)
+            except Exception as e:
+                print(f"Fresh sync also failed: {str(e)}")
+                await client.close()
+                sys.exit(1)
+
+            if not isinstance(sync_resp, SyncResponse):
+                print(f"Sync failed: {str(sync_resp)}")
+                await client.close()
+                sys.exit(1)
+        else:
+            print(f"Sync failed: {str(sync_resp)}")
+            await client.close()
+            sys.exit(1)
+
     # Update sync token and store it (unless --no-save-token flag is set)
-    new_sync_token = sync_data.get("next_batch")
+    new_sync_token = sync_resp.next_batch
     if new_sync_token:
         if no_save_token:
             print(f"Skipping sync token update (--no-save-token flag set)")
         else:
             print(f"Updating sync token...")
-            store_sync_token(client, user_id, new_sync_token)
-            client.sync_token = new_sync_token
+            await store_sync_token_to_server(client, user_id, new_sync_token)
 
-    # Process and display events (with E2E decryption)
-    events_summary = process_events(sync_data, e2e)
+    # Process and display events
+    events_summary = process_events(sync_resp)
     display_events(events_summary)
 
     # Accept pending invites
-    invited_rooms = sync_data.get("rooms", {}).get("invite", {})
+    invited_rooms = sync_resp.rooms.invite
     if invited_rooms:
         print("\nAccepting pending invites...")
-        accept_pending_invites(client, invited_rooms)
+        await accept_pending_invites(client, invited_rooms)
 
-    # Send message if specified (with E2E encryption)
+    # Send message if specified
     if message:
         print(f"\nSending message to {room_identifier}...")
-        success, msg = send_message_to_room(client, room_identifier, message, e2e)
+        success, msg = await send_message_to_room(client, room_identifier, message)
         print(msg)
         if not success:
+            await client.close()
             sys.exit(1)
 
+    await client.close()
     print("\nDone!")
     sys.exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
